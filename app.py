@@ -8,7 +8,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-
+#making my first changes
 ROOT = Path(__file__).resolve().parent
 INVENTORY_FILE = ROOT / "store_clothing_collection.xlsx"
 SALES_FILE = ROOT / "sales_records.json"
