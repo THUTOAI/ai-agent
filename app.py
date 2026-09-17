@@ -1,20 +1,26 @@
-import os
 import io
 import json
+import os
 import zipfile
-from email.parser import BytesParser
-from email import policy
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-#making my first changes
+
+from flask import Flask, jsonify, render_template, request
+
 ROOT = Path(__file__).resolve().parent
-INVENTORY_FILE = ROOT / "store_clothing_collection.xlsx"
-SALES_FILE = ROOT / "sales_records.json"
+DATA_DIR = ROOT / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+INVENTORY_FILE = DATA_DIR / "store_clothing_collection.xlsx"
+SALES_FILE = DATA_DIR / "sales_records.json"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = os.environ.get(
     "OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
+
+# Flask auto-discovers templates/ and static/ next to this file - no extra config needed.
+app = Flask(__name__)
 
 
 def read_inventory(workbook):
@@ -146,153 +152,123 @@ def stock_report():
     return report
 
 
-class ChatRequestHandler(SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=str(ROOT), **kwargs)
+@app.route("/")
+def index():
+    return render_template("index.html")
 
-    def do_GET(self):
-        if self.path == "/api/inventory":
-            try:
-                self.send_json({"inventory": inventory_payload()})
-            except (RuntimeError, ValueError) as error:
-                self.send_json({"error": str(error)}, 500)
-            return
-        if self.path == "/api/stock-report":
-            try:
-                self.send_json({"inventory": stock_report()})
-            except (RuntimeError, ValueError) as error:
-                self.send_json({"error": str(error)}, 500)
-            return
-        super().do_GET()
 
-    def do_POST(self):
-        if self.path == "/api/inventory/upload":
-            print("success")
-            self.upload_inventory()
-            return
-        if self.path == "/api/sales":
-            self.record_sale()
-            return
-        if self.path != "/api/chat":
-            print("failing here")
-            self.send_error(404, "Not found")
-            return
+@app.route("/api/inventory")
+def api_inventory():
+    try:
+        return jsonify({"inventory": inventory_payload()})
+    except (RuntimeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 500
 
-        try:
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-            request_data = json.loads(body)
-            messages = request_data.get("messages", [])
-            inventory = request_data.get("inventory", [])
-            if not messages or not isinstance(messages, list):
-                raise ValueError("At least one message is required")
 
-            api_key = os.environ.get("OPENROUTER_API_KEY")
-            if not api_key:
-                self.send_json(
-                    {"error": "OPENROUTER_API_KEY is not configured."}, 503)
-                return
+@app.route("/api/stock-report")
+def api_stock_report():
+    try:
+        return jsonify({"inventory": stock_report()})
+    except (RuntimeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 500
 
-            system_message = {
-                "role": "system",
-                "content": (
-                    "You are Tumi, the friendly Streetcode Clothing shop assistant. "
-                    "Answer clearly and briefly. Only make product, price, stock, colour, "
-                    "and size claims using the supplied inventory. For anything outside "
-                    "the shop, say you can help with Streetcode Clothing questions. "
-                    "Never ask for or process payment details.\n\n"
-                    "Use only the customer catalogue supplied below when answering. "
-                    "Do not use the private owner stock report or invent products.\n\n"
-                    f"Customer catalogue:\n{json.dumps(inventory, ensure_ascii=True)}"
-                ),
-            }
-            payload = json.dumps({
-                "model": OPENROUTER_MODEL,
-                "messages": [system_message, *messages[-10:]],
-                "temperature": 0.4,
-                "max_tokens": 250,
-            }).encode("utf-8")
-            upstream_request = Request(
-                OPENROUTER_URL,
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "http://127.0.0.1:8000",
-                    "X-Title": "Streetcode Clothing chatbot",
-                },
-                method="POST",
-            )
-            with urlopen(upstream_request, timeout=30) as response:
-                result = json.loads(response.read())
-            answer = result["choices"][0]["message"]["content"].strip()
-            self.send_json({"reply": answer})
-        except (ValueError, KeyError, json.JSONDecodeError) as error:
-            self.send_json({"error": str(error)}, 400)
-        except (HTTPError, URLError, TimeoutError) as error:
-            self.send_json({"error": f"LLM request failed: {error}"}, 502)
 
-    def upload_inventory(self):
-        try:
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-            message = BytesParser(policy=policy.default).parsebytes(
-                f"Content-Type: {self.headers.get('Content-Type', '')}\r\n\r\n".encode()
-                + body
-            )
-            print("upload_inventory called")
-            uploaded_file = next(
-                (part for part in message.iter_attachments()
-                 if part.get_param("name", header="content-disposition") == "file"),
-                None,
-            )
-            print("upload_inventory called", uploaded_file)
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    try:
+        request_data = request.get_json(force=True, silent=False)
+        messages = request_data.get("messages", [])
+        inventory = request_data.get("inventory", [])
+        if not messages or not isinstance(messages, list):
+            raise ValueError("At least one message is required")
 
-            if uploaded_file is None:
-                raise ValueError("Choose an Excel file to upload.")
-            content = uploaded_file.get_payload(decode=True)
-            inventory = read_inventory(io.BytesIO(content))
-            if not inventory:
-                raise ValueError("The workbook has no product rows.")
-            INVENTORY_FILE.write_bytes(content)
-            self.send_json(
-                {"inventory": inventory, "message": f"Loaded {len(inventory)} products."})
-        except (KeyError, RuntimeError, ValueError) as error:
-            self.send_json({"error": str(error)}, 400)
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            return jsonify({"error": "OPENROUTER_API_KEY is not configured."}), 503
 
-    def record_sale(self):
-        try:
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-            request_data = json.loads(body)
-            sku = str(request_data.get("sku", "")).strip()
-            quantity = int(request_data.get("quantity", 1))
-            if not sku or quantity < 1:
-                raise ValueError("A valid product and quantity are required.")
-            item = next(
-                (product for product in stock_report() if product["sku"] == sku), None)
-            if item is None:
-                raise ValueError("That product is not in the inventory.")
-            if quantity > item["stock_quantity"]:
-                raise ValueError(
-                    f"Only {item['stock_quantity']} unit(s) remain in stock.")
-            records = get_sales_records()
-            records.append({"sku": sku, "quantity": quantity, "recorded_at": __import__(
-                "datetime").datetime.now().isoformat()})
-            save_sales_records(records)
-            self.send_json({"message": "Sale recorded.",
-                           "inventory": stock_report()})
-        except (ValueError, TypeError, json.JSONDecodeError) as error:
-            self.send_json({"error": str(error)}, 400)
+        system_message = {
+            "role": "system",
+            "content": (
+                "You are Tumi, the friendly Streetcode Clothing shop assistant. "
+                "Answer clearly and briefly. Only make product, price, stock, colour, "
+                "and size claims using the supplied inventory. For anything outside "
+                "the shop, say you can help with Streetcode Clothing questions. "
+                "Never ask for or process payment details.\n\n"
+                "Use only the customer catalogue supplied below when answering. "
+                "Do not use the private owner stock report or invent products.\n\n"
+                f"Customer catalogue:\n{json.dumps(inventory, ensure_ascii=True)}"
+            ),
+        }
+        payload = json.dumps({
+            "model": OPENROUTER_MODEL,
+            "messages": [system_message, *messages[-10:]],
+            "temperature": 0.4,
+            "max_tokens": 250,
+        }).encode("utf-8")
+        upstream_request = Request(
+            OPENROUTER_URL,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://127.0.0.1:5000",
+                "X-Title": "Streetcode Clothing chatbot",
+            },
+            method="POST",
+        )
+        with urlopen(upstream_request, timeout=30) as response:
+            result = json.loads(response.read())
+        answer = result["choices"][0]["message"]["content"].strip()
+        return jsonify({"reply": answer})
+    except (ValueError, KeyError, json.JSONDecodeError) as error:
+        return jsonify({"error": str(error)}), 400
+    except (HTTPError, URLError, TimeoutError) as error:
+        return jsonify({"error": f"LLM request failed: {error}"}), 502
 
-    def send_json(self, data, status=200):
-        response = json.dumps(data).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(response)))
-        self.end_headers()
-        self.wfile.write(response)
+
+@app.route("/api/inventory/upload", methods=["POST"])
+def api_inventory_upload():
+    try:
+        uploaded_file = request.files.get("file")
+        if uploaded_file is None or uploaded_file.filename == "":
+            raise ValueError("Choose an Excel file to upload.")
+        content = uploaded_file.read()
+        inventory = read_inventory(io.BytesIO(content))
+        if not inventory:
+            raise ValueError("The workbook has no product rows.")
+        INVENTORY_FILE.write_bytes(content)
+        return jsonify({"inventory": inventory, "message": f"Loaded {len(inventory)} products."})
+    except (KeyError, RuntimeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@app.route("/api/sales", methods=["POST"])
+def api_sales():
+    try:
+        request_data = request.get_json(force=True, silent=False)
+        sku = str(request_data.get("sku", "")).strip()
+        quantity = int(request_data.get("quantity", 1))
+        if not sku or quantity < 1:
+            raise ValueError("A valid product and quantity are required.")
+        item = next(
+            (product for product in stock_report() if product["sku"] == sku), None)
+        if item is None:
+            raise ValueError("That product is not in the inventory.")
+        if quantity > item["stock_quantity"]:
+            raise ValueError(
+                f"Only {item['stock_quantity']} unit(s) remain in stock.")
+        records = get_sales_records()
+        records.append({
+            "sku": sku,
+            "quantity": quantity,
+            "recorded_at": datetime.now().isoformat(),
+        })
+        save_sales_records(records)
+        return jsonify({"message": "Sale recorded.", "inventory": stock_report()})
+    except (ValueError, TypeError, json.JSONDecodeError) as error:
+        return jsonify({"error": str(error)}), 400
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    server = ThreadingHTTPServer(("127.0.0.1", port), ChatRequestHandler)
-    print(f"Streetcode chatbot running at http://127.0.0.1:{port}")
-    server.serve_forever()
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
