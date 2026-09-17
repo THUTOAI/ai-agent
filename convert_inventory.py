@@ -115,7 +115,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert an inventory workbook to readable Python.")
     parser.add_argument("source", type=Path, nargs="?",
-                        default=Path("store_clothing_collection.xlsx"))
+                        default=Path("data/store_clothing_collection.xlsx"))
     parser.add_argument("destination", type=Path, nargs="?",
                         default=Path("inventory_data.py"))
     args = parser.parse_args()
